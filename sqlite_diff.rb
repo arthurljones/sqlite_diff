@@ -1,29 +1,36 @@
+#Gems
 require 'sqlite3'
 require 'mysql2'
-require 'json'
-require 'hashdiff'
-#require 'awesome_print'
 require 'lzma'
+require 'hashdiff'
+
+#Builtins
+require 'json'
 require 'yaml'
+require 'set'
+require 'date'
+require 'net/ftp'
+require 'digest'
 
 CONFIG = YAML.load_file("config.yml")
-SCHEMA = YAML.load_file("schema.yml")
 TABLE = CONFIG["table"]
 PRIMARY_KEY = CONFIG["primary_key"]
-COLUMN_LIST = SCHEMA.keys.join(',')
-QUERY = "select #{COLUMN_LIST} from #{TABLE} order by #{PRIMARY_KEY}"
-schema_string = SCHEMA.map{ |name, type| "#{name} #{type}" }.join(",")
-CREATE_STATEMENT = "create table #{TABLE} (#{schema_string})"
+COLUMNS = YAML.load_file("columns.yml")
+COLUMN_LIST = COLUMNS.join(',')
+BASE_QUERY = "select #{COLUMN_LIST} from #{TABLE}"
+MYSQL_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+def md5(data)
+  Digest::MD5.hexdigest(data)
+end
 
 def lzma_compress(path, delete_original = true)
   new_path = path + ".lzma"
-  File.open(path, "rb") do |input|
-    File.open(new_path, "wb") do |output|
-      output.write(LZMA.compress(input.read))
-    end
-  end
+  result = ""
+  File.open(path, "rb") { |input| result = LZMA.compress(input.read) }
+  File.open(new_path, "wb") { |output| output.write(result) }
   File.unlink(path) if delete_original
-  new_path
+  [new_path, md5(result)]
 end
 
 def lzma_decompress(path, delete_original = true)
@@ -37,150 +44,147 @@ def lzma_decompress(path, delete_original = true)
   new_path
 end
 
-def get_master_rows
-  master = Mysql2::Client.new(YAML.load_file("remote_db.yml"))
-  master.query(QUERY).to_a
+def get_new_master_data(start_date = nil)
+  db = Mysql2::Client.new(YAML.load_file("remote_db.yml"))
+  changed_query = BASE_QUERY.dup
+  changed_query << " where modified > \"#{start_date.strftime(MYSQL_DATETIME_FORMAT)}\"" if start_date
+  {
+    schema: db.query("describe #{TABLE}").each_with_object({}) {|row, result| result[row["Field"]] = row["Type"]},
+    primary_keys: Set.new(db.query("select #{PRIMARY_KEY} from #{TABLE}").map{ |row| row[PRIMARY_KEY] }),
+    changed_rows: db.query(changed_query)
+  }
 end
 
 def get_existing_rows(path)
   existing = SQLite3::Database.new(path, results_as_hash: true)
-  existing.execute(QUERY).map{ |row| row.select{ |k, v| String === k } }.to_enum
+  existing.execute(BASE_QUERY).map{ |row| row.select{ |k, v| String === k } }.to_enum
 end
 
-def new_db_from_rows(path, master_rows)
+def write_compressed_db(path, schema, rows)
   db = SQLite3::Database.new(path)
   db.execute("drop table if exists #{TABLE}")
-  db.execute(CREATE_STATEMENT)
 
-  master_rows.each_slice(500) do |rows|
+  schema_string = schema.map{ |name, type| "#{name} #{type}" }.join(",")
+  db.execute("create table #{TABLE} (#{schema_string})")
+
+  sub_group = "(#{(['?'] * schema.size).join(',')})"
+  rows.each_slice(500) do |rows|
     data = rows.select{|r| r[PRIMARY_KEY]}.map(&:values)
-    sub_group = "(#{(['?'] * SCHEMA.size).join(',')})"
     subs = ([sub_group] * data.count).join(',')
-    #puts subs
     db.execute("insert into #{TABLE} (#{COLUMN_LIST}) values #{subs}", data)
   end
   db.close()
   lzma_compress(path)
 end
 
-def write_diffs(path, diffs)
-  json = JSON.generate(diffs.merge(SCHEMA: SCHEMA.keys))
-  File.open(path + ".lzma", "wb") { |file| file.write(LZMA.compress(json)) }
+def write_compressed_json(path, obj)
+  path = path + ".lzma"
+  result = LZMA.compress(JSON.generate(obj))
+  checksum = md5(result)
+  File.open(path + ".lzma", "wb") { |file| file.write(result) }
+  [path, checksum]
 end
 
 def debug_print(str)
   #print str
 end
 
-def generate_diff(old_db_path, new_db_path, diff_path)
+def generate_diff(changed_since, old_db_path, new_db_path, diff_path)
+  since_string = changed_since ? " since #{changed_since.strftime(MYSQL_DATETIME_FORMAT)}" : ""
+  print "Reading modified rows in master database#{since_string}..."
+  master_data = get_new_master_data(changed_since)
+  changed_count = master_data[:changed_rows].count
+  puts " #{changed_count} of #{master_data[:primary_keys].count} changed"
 
-  print "Reading rows from remote master database..."
-  master_rows = get_master_rows
-  puts " Done"
-
-  if old_db_path.end_with?(".lzma")
-    print "Decompressing existing database..."
-    old_db_path = lzma_decompress(old_db_path, false)
-    puts " Done"
+  if old_db_path
+    if old_db_path.end_with?(".lzma")
+      print "Decompressing existing database..."
+      old_db_path = lzma_decompress(old_db_path, false)
+      puts " Done"
+    end
+    print "Reading rows from local database..."
+    existing_rows = get_existing_rows(old_db_path).each_with_object({}) do |row, result|
+      pk = row[PRIMARY_KEY]
+      result[pk] = row if pk
+    end
+    puts " Read #{existing_rows.count} rows"
+  else
+    puts "No existing database - starting fresh"
+    existing_rows = {}
   end
 
-  print "Reading rows from local database..."
-  existing_rows = get_existing_rows(old_db_path)
-  puts " Done"
-
+  print "Calculating database differences..."
   deleted_rows = []
   modified_rows = {}
   added_rows = []
-  unchanged_rows = 0
 
-  next_existing = true
-  next_master = false
-  existing_row = nil
-  existing_pk = nil
-
-  print "Calculating database differences..."
-  master_rows.each do |master_row|
-    master_pk = master_row[PRIMARY_KEY]
-    #For each master row, loop on as many existing rows as necessary
-    loop do
-      #puts ""
-      #puts "looping"
-      if next_existing
-        existing_row = existing_rows.next
-        #puts "next_existing #{!!existing_row}"
-        existing_pk = existing_row ? existing_row[PRIMARY_KEY] : nil
-        next_existing = false
-      end
-
-      if master_row && !master_pk
-        debug_print "0"
-        next_master = true
-      elsif existing_row && !existing_pk
-        debug_print "0"
-        next_existing = true
-      elsif !existing_row || (master_pk && master_pk < existing_pk)
-        debug_print "+"
-        #This row has been added in master
-        added_rows << master_row.values
-        next_master = true
-      elsif !master_row || (existing_pk && existing_pk < master_pk)
-        #This row has been removed from master
-        debug_print "-"
-        deleted_rows << existing_pk
-        next_existing = true
-      else
-        if existing_row != master_row
-          debug_print "~"
-          diff = HashDiff.diff(existing_row, master_row)
-          result = diff.inject({}) do |hash, diff|
-            raise "Nothing should be added or removed within a row" unless diff[0] == "~"
-            hash[diff[1]] = diff[3]
-            hash
-          end
-          modified_rows[master_pk] = result
-        else
-          debug_print "="
-          unchanged_rows += 1
-        end
-        next_existing = true
-        next_master = true
-      end
-
-      if next_master
-        next_master = false
-        break
-      end
+  master_pks = master_data[:primary_keys]
+  existing_rows.delete_if do |pk, row|
+    if master_pks.include?(pk)
+      false
+    else
+      deleted_rows << pk
+      true
     end
   end
 
-  #Any remaining rows in the existing database have been deleted in master
-  loop do
-    next_existing = existing_rows.next rescue nil
-    break unless next_existing
-    debug_print "-"
-    pk = next_existing[PRIMARY_KEY]
-    deleted_rows << pk if pk
+  master_data[:changed_rows].each do |master_row|
+    pk = master_row[PRIMARY_KEY]
+    next unless pk
+    existing_row = existing_rows[pk]
+    if existing_row
+      diff = HashDiff.diff(existing_row, master_row)
+      if diff.count > 0
+        result = diff.each_with_object({}) do |diff, hash|
+          raise "Nothing should be added or removed within a row" unless diff[0] == "~"
+          hash[diff[1]] = diff[3]
+        end
+        modified_rows[pk] = result
+      end
+    else
+      added_rows << master_row
+    end
+
+    existing_rows[pk] = master_row
   end
   puts " Done"
 
   puts "- #{modified_rows.count} Rows Modified"
   puts "- #{added_rows.count} Rows Added"
   puts "- #{deleted_rows.count} Rows Deleted"
-  puts "- #{unchanged_rows} Rows Unchanged"
 
   if (modified_rows.count + added_rows.count + deleted_rows.count) > 0
-    print "Writing all master rows to compressed local SQLite database #{new_db_path}.lzma..."
-    new_db_from_rows(new_db_path, master_rows)
-    puts" Done"
+    print "Writing changed database to compressed SQLite file..."
+    schema = COLUMNS.each_with_object({}){ |column, result| result[column] = master_data[:schema][column] }
+    result = write_compressed_db(new_db_path, schema, existing_rows.values)
+    puts " Done (#{result.first}, md5: #{result.last})"
 
-    print "Writing differences to compressed json file #{diff_path}.lzma..."
-    write_diffs(diff_path, modified: modified_rows, added: added_rows, deleted: deleted_rows)
-    puts " Done"
+    print "Writing differences to compressed json file..."
+    output = {
+      columns: COLUMNS,
+      modified: modified_rows,
+      added: added_rows.map(&:values),
+      deleted: deleted_rows
+    }
+    result = write_compressed_json(diff_path, output)
+    puts " Done (#{result.first}, md5: #{result.last})"
   else
     puts "No changes to upload"
   end
 end
 
-time = Time.now.utc.strftime("%Y%m%dT%H%M%S")
-prefix = CONFIG["output_prefix"]
-generate_diff(ARGV[0], "#{prefix}data-#{time}.db", "#{prefix}diff-#{time}.json")
+def diff_from_file(file)
+  if file
+    filename = File.basename(file).partition(".").first
+    previous_time_string = filename.match(/-(\d{8}T\d{6})\Z/){ |match| match[1] }
+    previous_time = DateTime.parse(previous_time_string) if previous_time_string
+  else
+    previous_time = nil
+  end
+
+  current_time = Time.now.utc.strftime("%Y%m%dT%H%M%S")
+  prefix = CONFIG["output_prefix"]
+  generate_diff(previous_time, file, "#{prefix}data-#{current_time}.db", "#{prefix}diff-#{current_time}.json")
+end
+
+diff_from_file(ARGV.first)
