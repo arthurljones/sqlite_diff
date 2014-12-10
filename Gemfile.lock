@@ -1,0 +1,20 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    ffi (1.9.6)
+    hashdiff (0.2.2)
+    io-like (0.3.0)
+    mysql2 (0.3.17)
+    ruby-xz (0.2.1)
+      ffi
+      io-like
+    sqlite3 (1.3.10)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  hashdiff
+  mysql2
+  ruby-xz
+  sqlite3

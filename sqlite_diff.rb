@@ -1,3 +1,8 @@
+#This script uses Bundler: http://bundler.io/
+
+require 'rubygems'
+require 'bundler/setup'
+
 #Gems
 require 'sqlite3'
 require 'mysql2'
