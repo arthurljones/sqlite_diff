@@ -7,7 +7,7 @@ require 'bundler/setup'
 require 'sqlite3'
 require 'mysql2'
 require 'hashdiff'
-require 'xz' #gem ruby-xz
+require 'xz'
 
 #Builtins
 require 'json'
@@ -16,6 +16,10 @@ require 'set'
 require 'date'
 require 'net/ftp'
 require 'digest'
+
+#TODO: Lockfile on FTP to prevent multiple instances running at once
+#TODO: Check MD5s when downloading
+#TODO: Include file sizes in manifest so clients can decide smallest changeset to download
 
 CONFIG = YAML.load_file("config.yml")
 TABLE = CONFIG["table"]
@@ -214,8 +218,6 @@ def get_most_recent_db(ftp, manifest)
 end
 
 def main
-  #TODO: Check MD5s when downloading
-
   print "Connecting to FTP server..."
   ftp = start_ftp_session
   puts " Done"
