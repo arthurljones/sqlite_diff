@@ -1,8 +1,8 @@
 #Gems
 require 'sqlite3'
 require 'mysql2'
-require 'lzma'
 require 'hashdiff'
+require 'xz' #gem ruby-xz
 
 #Builtins
 require 'json'
@@ -15,37 +15,33 @@ require 'digest'
 CONFIG = YAML.load_file("config.yml")
 TABLE = CONFIG["table"]
 PRIMARY_KEY = CONFIG["primary_key"]
-COLUMNS = YAML.load_file("columns.yml")
+COLUMNS = CONFIG["columns"]
 COLUMN_LIST = COLUMNS.join(',')
 BASE_QUERY = "select #{COLUMN_LIST} from #{TABLE}"
 MYSQL_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+FTP_CONFIG = CONFIG["ftp"]
+COMPRESSED_EXT = ".xz"
 
 def md5(data)
   Digest::MD5.hexdigest(data)
 end
 
-def lzma_compress(path, delete_original = true)
-  new_path = path + ".lzma"
-  result = ""
-  File.open(path, "rb") { |input| result = LZMA.compress(input.read) }
-  File.open(new_path, "wb") { |output| output.write(result) }
-  File.unlink(path) if delete_original
-  [new_path, md5(result)]
+def compress_file(path, delete_original = true)
+  new_path = path + COMPRESSED_EXT
+  XZ.compress_file(path, new_path)
+  File.unlink(path) if delete_original && path != new_path
+  { new_path => md5(File.read(new_path)) }
 end
 
-def lzma_decompress(path, delete_original = true)
-  new_path = path.gsub(/\.lzma\Z/, "")
-  File.open(path, "rb") do |input|
-    File.open(new_path, "wb") do |output|
-      output.write(LZMA.decompress(input.read))
-    end
-  end
-  File.unlink(path) if delete_original
+def decompress_file(path, delete_original = true)
+  new_path = path.gsub(/#{Regexp.quote(COMPRESSED_EXT)}\Z/, "")
+  XZ.decompress_file(path, new_path)
+  File.unlink(path) if delete_original && path != new_path
   new_path
 end
 
 def get_new_master_data(start_date = nil)
-  db = Mysql2::Client.new(YAML.load_file("remote_db.yml"))
+  db = Mysql2::Client.new(CONFIG["database"])
   changed_query = BASE_QUERY.dup
   changed_query << " where modified > \"#{start_date.strftime(MYSQL_DATETIME_FORMAT)}\"" if start_date
   {
@@ -74,15 +70,14 @@ def write_compressed_db(path, schema, rows)
     db.execute("insert into #{TABLE} (#{COLUMN_LIST}) values #{subs}", data)
   end
   db.close()
-  lzma_compress(path)
+  compress_file(path)
 end
 
 def write_compressed_json(path, obj)
-  path = path + ".lzma"
-  result = LZMA.compress(JSON.generate(obj))
-  checksum = md5(result)
-  File.open(path + ".lzma", "wb") { |file| file.write(result) }
-  [path, checksum]
+  path = path + COMPRESSED_EXT
+  result = XZ.compress(JSON.generate(obj))
+  File.open(path, "wb") { |file| file.write(result) }
+  { path => md5(result) }
 end
 
 def debug_print(str)
@@ -97,9 +92,9 @@ def generate_diff(changed_since, old_db_path, new_db_path, diff_path)
   puts " #{changed_count} of #{master_data[:primary_keys].count} changed"
 
   if old_db_path
-    if old_db_path.end_with?(".lzma")
+    if old_db_path.end_with?(COMPRESSED_EXT)
       print "Decompressing existing database..."
-      old_db_path = lzma_decompress(old_db_path, false)
+      old_db_path = decompress_file(old_db_path, false)
       puts " Done"
     end
     print "Reading rows from local database..."
@@ -156,8 +151,8 @@ def generate_diff(changed_since, old_db_path, new_db_path, diff_path)
   if (modified_rows.count + added_rows.count + deleted_rows.count) > 0
     print "Writing changed database to compressed SQLite file..."
     schema = COLUMNS.each_with_object({}){ |column, result| result[column] = master_data[:schema][column] }
-    result = write_compressed_db(new_db_path, schema, existing_rows.values)
-    puts " Done (#{result.first}, md5: #{result.last})"
+    data = write_compressed_db(new_db_path, schema, existing_rows.values)
+    puts " Done (#{data})"
 
     print "Writing differences to compressed json file..."
     output = {
@@ -166,25 +161,96 @@ def generate_diff(changed_since, old_db_path, new_db_path, diff_path)
       added: added_rows.map(&:values),
       deleted: deleted_rows
     }
-    result = write_compressed_json(diff_path, output)
-    puts " Done (#{result.first}, md5: #{result.last})"
+    diff = write_compressed_json(diff_path, output)
+    puts " Done (#{diff})"
+
+    data.merge(diff)
   else
-    puts "No changes to upload"
+    puts "No changes"
+    nil
   end
 end
 
-def diff_from_file(file)
-  if file
-    filename = File.basename(file).partition(".").first
-    previous_time_string = filename.match(/-(\d{8}T\d{6})\Z/){ |match| match[1] }
-    previous_time = DateTime.parse(previous_time_string) if previous_time_string
-  else
-    previous_time = nil
-  end
+def timestamp_from_filename(filename)
+  basename = File.basename(filename).partition(".").first
+  previous_time_string = basename.match(/-(\d{8}T\d{6})\Z/){ |match| match[1] }
+  previous_time = DateTime.parse(previous_time_string) if previous_time_string
+end
 
+def diff_from_file(file)
+  previous_time = file ? timestamp_from_filename(file) : nil
   current_time = Time.now.utc.strftime("%Y%m%dT%H%M%S")
   prefix = CONFIG["output_prefix"]
   generate_diff(previous_time, file, "#{prefix}data-#{current_time}.db", "#{prefix}diff-#{current_time}.json")
 end
 
-diff_from_file(ARGV.first)
+def start_ftp_session
+  ftp = Net::FTP.new(FTP_CONFIG["server"])
+  ftp.login(FTP_CONFIG["username"], FTP_CONFIG["password"])
+  ftp
+end
+
+def get_manifest(ftp)
+  compressed_manifest_data = ftp.getbinaryfile("manifest.json#{COMPRESSED_EXT}", nil)
+  manifest_data = XZ.decompress(compressed_manifest_data)
+  JSON.parse(manifest_data)
+end
+
+def put_manifest(ftp, manifest)
+end
+
+def get_most_recent_db(ftp, manifest)
+  db_files = manifest.keys.select{|file, md5| file =~ /data-/}
+  db_files_by_timestamp = db_files.each_with_object({}){|(file, md5), result| result[timestamp_from_filename(file)] = file}
+  most_recent = db_files_by_timestamp[db_files_by_timestamp.keys.max]
+  ftp.getbinaryfile(most_recent)
+
+  most_recent
+end
+
+def main
+  #TODO: Check MD5s when downloading
+
+  print "Connecting to FTP server..."
+  ftp = start_ftp_session
+  puts " Done"
+
+  print "Fetching manifest..."
+  manifest = get_manifest(ftp)
+  puts " Done"
+
+  print "Fetching most recent client database..."
+  most_recent = get_most_recent_db(ftp, manifest)
+  puts " Done (#{most_recent})"
+
+  result = diff_from_file(most_recent)
+
+  if result
+    print "Uploading database and diff to ftp..."
+    result.keys.each { |file| ftp.putbinaryfile(file) }
+    puts " Done"
+
+    print "Writing updated manifest and checksum to ftp..."
+    manifest = manifest.merge(result)
+    compressed_manifest, manifest_md5 = write_compressed_json("manifest.json", manifest).first
+    ftp.putbinaryfile(compressed_manifest)
+    manifest_checksum = "manifest.md5"
+    File.open(manifest_checksum, "wb") { |file| file.write(manifest_md5) }
+    ftp.putbinaryfile(manifest_checksum)
+    puts " Done"
+  else
+    puts "Nothing to upload"
+  end
+
+  print "Cleaning up..."
+  %W(#{COMPRESSED_EXT.gsub('.', '')} db json md5).each do |ext|
+    Dir["*.#{ext}"].each do |file|
+      File.unlink(file)
+    end
+  end
+  puts " Done"
+end
+
+#compress_file("manifest.json", false)
+#compress_file("suspension_data-20130923T000000.db", false)
+main
