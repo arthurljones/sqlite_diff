@@ -251,6 +251,4 @@ def main
   puts " Done"
 end
 
-#compress_file("manifest.json", false)
-#compress_file("suspension_data-20130923T000000.db", false)
 main
