@@ -20,6 +20,7 @@ require 'digest'
 #TODO: Lockfile on FTP to prevent multiple instances running at once
 #TODO: Check MD5s when downloading
 #TODO: Include file sizes in manifest so clients can decide smallest changeset to download
+#TODO: Make sure everything flows correctly if there's no remote manifest (probbaly crashes right now)
 
 CONFIG = YAML.load_file("config.yml")
 TABLE = CONFIG["table"]
