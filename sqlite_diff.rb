@@ -19,8 +19,6 @@ require 'zlib'
 
 #TODO: Lockfile on FTP to prevent multiple instances running at once
 #TODO: Check MD5s when downloading
-#TODO: Include file sizes in manifest so clients can decide smallest changeset to download
-#TODO: Make sure everything flows correctly if there's no remote manifest (probbaly crashes right now)
 
 CONFIG = YAML.load_file("config.yml")
 
@@ -59,61 +57,36 @@ class Logger
 end
 
 class Compressor
-  class << self
-    def compress_data(data)
-      StringIO.open do |stream|
-        compress(stream, data)
-        stream.string
-      end
+  def compress_file(path)
+    new_path = path + extension
+    data = File.read(path)
+    File.open(new_path, "wb") do |file|
+      writer = Zlib::GzipWriter.new(file)
+      writer.write(data)
+      writer.close
     end
-
-    def decompress_data(data)
-      StringIO.open do |stream|
-        decompress(stream, data)
-        stream.string
-      end
-    end
-
-    def compress_file(path)
-      new_path = path + extension
-      data = File.read(path)
-      File.open(new_path, "wb") { |file| compress(file, data) }
-      new_path
-    end
-
-    def decompress_file(path)
-      new_path = path.gsub(/#{Regexp.quote(extension)}\Z/, "")
-      data = File.read(path)
-      File.open(new_path, "wb") { |file| decompress(file, data) }
-      new_path
-    end
-
-    def extension
-      ".gz"
-    end
-
-    def write_compressed_json(path, obj)
-      path = path + extension
-      result = compress_data(JSON.generate(obj))
-      File.open(path, "wb") { |file| file.write(result) }
-      path
-    end
-
-  private
-
-    def compress(stream, data)
-      bz2 = Zlib::GzipWriter.new(stream)
-      bz2.write(data)
-      bz2.close
-    end
-
-    def decompress(stream)
-      bz2 = ZLib::GzipReader.new(stream)
-      result = bz2.read
-      bz2.close
-      result
-    end
+    new_path
   end
+
+  def decompress_file(path)
+    new_path = path.gsub(/#{Regexp.quote(extension)}\Z/, "")
+    input = File.open(path)
+    reader = Zlib::GzipReader.new(input)
+    data = reader.read
+    reader.close
+    File.open(new_path, "wb") { |file| file.write(data) }
+    new_path
+  end
+
+  def extension
+    ".gz"
+  end
+
+  def write_compressed_json(path, obj)
+    File.open(path, "wb") { |file| file.write(JSON.generate(obj)) }
+    compress_file(path)
+  end
+
 end
 
 class FTPSession
@@ -128,9 +101,14 @@ class FTPSession
   end
 
   def manifest
-    compressed_data = @session.getbinaryfile("manifest.json#{@compressor.extension}", nil)
-    data = @compressor.decompress_data(compressed_data)
-    JSON.parse(data)
+    compressed_manifest = "manifest.json#{@compressor.extension}"
+    if @list.include?(compressed_manifest)
+      @session.getbinaryfile(compressed_manifest)
+      decompressed_manifest = @compressor.decompress_file(compressed_manifest)
+      JSON.parse(File.read(decompressed_manifest))
+    else
+      []
+    end
   end
 
   def manifest=(manifest)
@@ -146,13 +124,15 @@ class FTPSession
 
   def most_recent_db(manifest)
     most_recent_db = manifest
-    .map{ |entry| entry[:file] }
-    .select{ |filename| file =~ /data-/ }
-    .max_by{ |filename| Util.timestamp_from_filename(file) }
+      .map{ |entry| entry["file"] }
+      .select{ |filename| filename =~ /data-/ }
+      .max_by{ |filename| Util.timestamp_from_filename(filename) }
 
-    @session.getbinaryfile(most_recent_db)
-    @logger.nest(most_recent)
-    most_recent
+    if most_recent_db
+      @session.getbinaryfile(most_recent_db)
+      @logger.nest(most_recent_db)
+      most_recent_db
+    end
   end
 
   def put(file)
@@ -231,7 +211,6 @@ private
     @logger.nest("Backing up old version #{old_name} -> #{new_name}")
     rename(old_name, new_name)
   end
-
 end
 
 class SQLiteDiff
@@ -244,61 +223,45 @@ class SQLiteDiff
 
   def initialize
     @nesting_level = 0
-    @compressor = Compressor
+    @compressor = Compressor.new
     @logger = Logger.new
     @ftp = FTPSession.new(@compressor, @logger)
   end
 
   def main
-    @logger.nest("Connecting to FTP server")
-    ftp = start_ftp_session
-    @logger.nest(" Done")
-
-    @logger.nest("Fetching manifest")
-    manifest = get_manifest(ftp)
-    @logger.nest(" Done")
-
-    most_recent = @logger.nest("Fetching most recent client database") { get_most_recent_db(ftp, manifest) }
+    manifest = @logger.nest("Fetching manifest") { @ftp.manifest }
+    most_recent = @logger.nest("Fetching most recent client database") { @ftp.most_recent_db(manifest) }
     new_files = @logger.nest("Calculating database differences") { diff_from_file(most_recent) }
 
     if new_files
       manifest += manifest + new_files.map{ |file| Util.manifest_data(file) }
-      @logger.nest("Uploading database and diff to ftp") { new_files.each { |file| safe_put(ftp, file) } }
-      @logger.nest("Writing updated manifest and checksum to ftp") { put_manifest(ftp, manifest) }
+      @logger.nest("Uploading database and diff to ftp") { new_files.each { |file| @ftp.put(file) } }
+      @logger.nest("Writing updated manifest and checksum to ftp") { @ftp.manifest = manifest }
     else
       @logger.nest("Nothing to upload")
     end
 
     @logger.nest("Cleaning up") { clean_temp_files }
-
-    ftp.close
   end
 
-
 private
-
 
   def get_new_master_data(start_date = nil)
     db = Mysql2::Client.new(CONFIG["database"])
     changed_query = BASE_QUERY.dup
     changed_query << " where modified > \"#{start_date.strftime(MYSQL_DATETIME_FORMAT)}\"" if start_date
 
-    schema = db.query("describe #{TABLE}").each_with_object({}) {|row, result| result[row["Field"]] = row["Type"]},
-    primary_keys = Set.new(db.query("select #{PRIMARY_KEY} from #{TABLE}").map{ |row| row[PRIMARY_KEY] }),
+    schema = db.query("describe #{TABLE}").each_with_object({}) {|row, result| result[row["Field"]] = row["Type"]}
+    primary_keys = Set.new(db.query("select #{PRIMARY_KEY} from #{TABLE}").map{ |row| row[PRIMARY_KEY] })
     changed_rows = db.query(changed_query)
 
-    @logger.nest("#{r[:changed_rows].count} of #{r[:primary_keys].count} changed")
+    @logger.nest("Read #{changed_rows.count} changed rows of #{primary_keys.count} total")
 
     {
       schema: schema,
       primary_keys: primary_keys,
       changed_rows: changed_rows
     }
-  end
-
-  def get_existing_rows(path)
-    existing = SQLite3::Database.new(path, results_as_hash: true)
-    existing.execute(BASE_QUERY).map{ |row| row.select{ |k, v| String === k } }.to_enum
   end
 
   def write_compressed_db(path, schema, rows)
@@ -341,7 +304,7 @@ private
       if existing_row
         diffs = HashDiff.diff(existing_row, master_row)
         if diffs.count > 0
-          result = diff.each_with_object({}) do |diff, hash|
+          result = diffs.each_with_object({}) do |diff, hash|
             raise "Nothing should be added or removed within a row" unless diff[0] == "~"
             hash[diff[1]] = diff[3]
           end
@@ -365,34 +328,41 @@ private
   end
 
   def get_rows_from_sqlite(file)
-    if old_db_path
-      if old_db_path.end_with?(@compressor.extension)
-        @logger.nest("Decompressing existing database")
-        old_db_path = @compressor.decompress_file(old_db_path, false)
+    if file
+      if file.end_with?(@compressor.extension)
+        @logger.nest("Decompressing file")
+        file = @compressor.decompress_file(file)
       end
-      @logger.nest("Reading rows from local database")
-      existing_rows = get_existing_rows(old_db_path).each_with_object({}) do |row, result|
-        pk = row[PRIMARY_KEY]
-        result[pk] = row if pk
+      @logger.nest("Reading rows") do
+
+        db = SQLite3::Database.new(file, results_as_hash: true)
+        raw_rows = db.execute(BASE_QUERY).map{ |row| row.select{ |k, v| String === k } }.to_enum
+        rows = raw_rows.each_with_object({}) do |row, result|
+          pk = row[PRIMARY_KEY]
+          result[pk] = row if pk
+        end
+        @logger.nest("Read #{rows.count} rows")
+        rows
       end
-      @logger.nest(" Read #{existing_rows.count} rows")
     else
-      @logger.nest("No existing database - starting fresh")
-      existing_rows = {}
+      @logger.nest("No database")
+      {}
     end
   end
 
   def generate_diff(changed_since, old_db_path, new_db_path, diff_path)
     since_string = changed_since ? " changed since #{changed_since.strftime(MYSQL_DATETIME_FORMAT)}" : ""
-    master_data = @logger.nest("Reading modified rows in master#{since_string}") do
+    master_data = @logger.nest("Reading rows in master#{since_string}") do
       get_new_master_data(changed_since)
     end
+
+    existing_rows = @logger.nest("Reading existing database") { get_rows_from_sqlite(old_db_path) }
 
     differences = @logger.nest("Calculating database differences") do
       calculate_diff_and_update_existing(master_data[:primary_keys], master_data[:changed_rows], existing_rows)
     end
 
-    if (modified_rows.count + added_rows.count + deleted_rows.count) > 0
+    if (differences[:modified].count + differences[:added].count + differences[:deleted].count) > 0
       files = []
 
       files << @logger.nest("Writing changed database to compressed SQLite file") do
@@ -400,8 +370,8 @@ private
         write_compressed_db(new_db_path, schema, existing_rows.values)
       end
 
-      files << @logger.nest("Writing differences to compressed json file", -> (r) { "Done (#{r})" }) do
-        write_compressed_json(diff_path, differences)
+      files << @logger.nest("Writing differences to compressed json file") do
+        @compressor.write_compressed_json(diff_path, differences)
       end
 
       files
@@ -429,6 +399,6 @@ private
 
 end
 
-ftp = FTPSession.new(Compressor, Logger.new)
-ftp.compress_and_upload_dir("tmp")
-#differ.main
+#ftp = FTPSession.new(Compressor.new, Logger.new)
+#ftp.compress_and_upload_dir("tmp")
+SQLiteDiff.new.main
