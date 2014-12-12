@@ -63,6 +63,7 @@ private
 
   def get_new_master_data(start_date = nil)
     db = Mysql2::Client.new(CONFIG["database"])
+    db.query("SET @@session.time_zone='+00:00'")
     changed_query = BASE_QUERY.dup
     changed_query << " where modified > \"#{start_date.strftime(MYSQL_DATETIME_FORMAT)}\"" if start_date
 
