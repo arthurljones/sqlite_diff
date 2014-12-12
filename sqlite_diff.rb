@@ -7,6 +7,7 @@ require 'bundler/setup'
 require 'sqlite3'
 require 'mysql2'
 require 'hashdiff'
+require 'active_support/core_ext/hash/indifferent_access'
 
 #Builtins
 require 'json'
@@ -14,204 +15,17 @@ require 'yaml'
 require 'set'
 require 'date'
 require 'net/ftp'
-require 'digest'
-require 'zlib'
+
+#Local
+require_relative "util"
+require_relative "logger"
+require_relative "compressor"
+require_relative "ftp_session"
 
 #TODO: Lockfile on FTP to prevent multiple instances running at once
 #TODO: Check MD5s when downloading
 
-CONFIG = YAML.load_file("config.yml")
-
-class Util
-  def self.timestamp_from_filename(filename)
-    basename = File.basename(filename).partition(".").first
-    previous_time_string = basename.match(/-(\d{8}T\d{6})\Z/){ |match| match[1] }
-    DateTime.parse(previous_time_string) if previous_time_string
-  end
-
-  def self.manifest_data(file)
-    {
-      :file => file,
-      :checksum => Digest::MD5.hexdigest(File.read(file)),
-      :size => File.size(file)
-    }
-  end
-end
-
-class Logger
-  def initialize
-    @nesting_level = 0
-  end
-
-  def nest(message)
-    prefix = " " * 2 * @nesting_level
-    puts("#{prefix}#{message}")
-
-    if block_given?
-      @nesting_level += 1
-      result = yield
-      @nesting_level -= 1
-      result
-    end
-  end
-end
-
-class Compressor
-  def compress_file(path)
-    new_path = path + extension
-    data = File.read(path)
-    File.open(new_path, "wb") do |file|
-      writer = Zlib::GzipWriter.new(file)
-      writer.write(data)
-      writer.close
-    end
-    new_path
-  end
-
-  def decompress_file(path)
-    new_path = path.gsub(/#{Regexp.quote(extension)}\Z/, "")
-    input = File.open(path)
-    reader = Zlib::GzipReader.new(input)
-    data = reader.read
-    reader.close
-    File.open(new_path, "wb") { |file| file.write(data) }
-    new_path
-  end
-
-  def extension
-    ".gz"
-  end
-
-  def write_compressed_json(path, obj)
-    File.open(path, "wb") { |file| file.write(JSON.generate(obj)) }
-    compress_file(path)
-  end
-
-end
-
-class FTPSession
-
-  def initialize(compressor, logger)
-    config = CONFIG["ftp"]
-    @compressor = compressor
-    @logger = logger
-    @session = Net::FTP.new(config["server"])
-    @session.login(config["username"], config["password"])
-    @list = Set.new(@session.nlst)
-  end
-
-  def manifest
-    compressed_manifest = "manifest.json#{@compressor.extension}"
-    if @list.include?(compressed_manifest)
-      @session.getbinaryfile(compressed_manifest)
-      decompressed_manifest = @compressor.decompress_file(compressed_manifest)
-      JSON.parse(File.read(decompressed_manifest))
-    else
-      []
-    end
-  end
-
-  def manifest=(manifest)
-    compressed_manifest = @compressor.write_compressed_json("manifest.json", manifest)
-    put(compressed_manifest)
-    @logger.nest(compressed_manifest)
-    manifest_checksum = Util.manifest_data(compressed_manifest)[:checksum]
-    manifest_checksum_file = "manifest.md5"
-    File.open(manifest_checksum_file, "wb") { |file| file.write(manifest_checksum) }
-    put(manifest_checksum_file)
-    @logger.nest(manifest_checksum_file)
-  end
-
-  def most_recent_db(manifest)
-    most_recent_db = manifest
-      .map{ |entry| entry["file"] }
-      .select{ |filename| filename =~ /data-/ }
-      .max_by{ |filename| Util.timestamp_from_filename(filename) }
-
-    if most_recent_db
-      @session.getbinaryfile(most_recent_db)
-      @logger.nest(most_recent_db)
-      most_recent_db
-    end
-  end
-
-  def put(file)
-    move_old_file(file) if @list.include?(file)
-    @logger.nest("Uploading #{file}")
-    @session.putbinaryfile(file)
-    @list << file
-  end
-
-  def compress_and_upload_dir(dir)
-    old_dir = Dir.getwd
-    Dir.chdir(dir)
-    new_manifest = @logger.nest("Compressing and uploading files in #{dir}") do
-      Dir["*.*"].map do |file|
-        @logger.nest(file) do
-          if file.end_with?(@compressor.extension)
-            @logger.nest("Skipping")
-            next
-          end
-
-          compressed = false
-          if %w(md5 html).include?(File.extname(file))
-            @logger.nest("Not compressing")
-          else
-            @logger.nest("Compressing")
-            file = @compressor.compress_file(file)
-            compressed = true
-          end
-
-          @logger.nest("Adding to manifest")
-          entry = Util.manifest_data(file)
-
-          put(file)
-
-          if compressed
-            @logger.nest("Removing #{file}")
-            File.unlink(file)
-          end
-
-          entry
-        end
-      end.compact
-    end
-
-    @logger.nest("Uploading manifest") do
-      self.manifest = new_manifest
-    end
-
-    @logger.nest("Removing manifest files")
-    Dir["manifest*"].each{ |file| File.unlink(file) }
-
-    Dir.chdir(old_dir)
-  end
-
-private
-
-  def rename(old_name, new_name)
-    @session.rename(old_name, new_name)
-    @list.delete(old_name)
-    @list << new_name
-  end
-
-  def move_old_file(file, depth = 0)
-    new_name = "#{file}.#{depth}"
-    old_name =  depth > 0 ? "#{file}.#{depth - 1}" : file
-
-    if @list.include?(new_name)
-      if depth >= CONFIG["max_previous_file_versions"]
-        @logger.nest("Dropping oldest version #{new_name}")
-        @session.delete(new_name)
-      else
-        move_old_file(file, depth + 1)
-      end
-    end
-
-    @logger.nest("Backing up old version #{old_name} -> #{new_name}")
-    rename(old_name, new_name)
-  end
-end
+CONFIG = YAML.load_file("config.yml").with_indifferent_access
 
 class SQLiteDiff
   TABLE = CONFIG["table"]
@@ -225,7 +39,7 @@ class SQLiteDiff
     @nesting_level = 0
     @compressor = Compressor.new
     @logger = Logger.new
-    @ftp = FTPSession.new(@compressor, @logger)
+    @ftp = FTPSession.new(CONFIG["ftp"].merge(compressor: @compressor, logger: @logger))
   end
 
   def main
@@ -399,6 +213,6 @@ private
 
 end
 
-#ftp = FTPSession.new(Compressor.new, Logger.new)
-#ftp.compress_and_upload_dir("tmp")
+#FTPSession.new(CONFIG["ftp"].merge(compressor: Compressor.new, logger: Logger.new))compress_and_upload_dir("tmp")
+
 SQLiteDiff.new.main
