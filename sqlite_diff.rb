@@ -34,6 +34,7 @@ class SQLiteDiff
   COLUMN_LIST = COLUMNS.join(',')
   BASE_QUERY = "select #{COLUMN_LIST} from #{TABLE}"
   MYSQL_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+  SQLITE_DATETIME_FORMAT = "%s"
 
   def initialize
     @nesting_level = 0
@@ -87,8 +88,9 @@ private
 
     sub_group = "(#{(['?'] * schema.size).join(',')})"
     rows.each_slice(500) do |row_group|
-      data = row_group.select{|r| r[PRIMARY_KEY]}.map(&:values)
+      data = row_group.select{ |row| row[PRIMARY_KEY] }.map(&:values)
       subs = ([sub_group] * data.count).join(',')
+      data.each { |row| row.map! { |item| item.respond_to?(:strftime) ? item.strftime(SQLITE_DATETIME_FORMAT) : item } }
       db.execute("insert into #{TABLE} (#{COLUMN_LIST}) values #{subs}", data)
     end
     db.close()
@@ -213,6 +215,6 @@ private
 
 end
 
-#FTPSession.new(CONFIG["ftp"].merge(compressor: Compressor.new, logger: Logger.new))compress_and_upload_dir("tmp")
+#FTPSession.new(CONFIG["ftp"].merge(compressor: Compressor.new, logger: Logger.new)).compress_and_upload_dir("tmp")
 
 SQLiteDiff.new.main
